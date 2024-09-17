@@ -14,7 +14,7 @@ log = get_plugin_logger(__name__)
 
 DEFAULT_REMOVE_RE = r"^[0-9]+-"
 FILE_NAME_RE = r'(?:(?P<dir>[^/]+)/)?(?P<file>[^/]+)\.(?P<ext>[^./]+)$'
-SHORTLINK_RE = r'^(?P<link>(?:[^/]*/)?[^/#]+)(?P<anchor>#[^/]+)?$'
+SHORTLINK_RE = r'^(?P<link>(?:[^/]*/)?[^/:#]+)(?P<anchor>#[^/]+)?$'
 IGNORE_DIRS = ['css','fonts', 'img', 'js', 'search']
 
 
