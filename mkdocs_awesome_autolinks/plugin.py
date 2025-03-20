@@ -1,5 +1,5 @@
 from collections import defaultdict
-import os
+from pathlib import PurePath
 import re
 from typing import Optional
 from mkdocs import utils
@@ -13,14 +13,14 @@ from mkdocs.plugins import get_plugin_logger, BasePlugin
 log = get_plugin_logger(__name__)
 
 DEFAULT_REMOVE_RE = r"^[0-9]+-"
-FILE_NAME_RE = r'(?:(?P<dir>[^/]+)/)?(?P<file>[^/]+)\.(?P<ext>[^./]+)$'
-SHORTLINK_RE = r'^(?P<link>(?:[^/]*/)?[^/:#]+)(?P<anchor>#[^/]+)?$'
-IGNORE_DIRS = ['css', 'fonts', 'img', 'js', 'search']
+FILE_NAME_RE = r'^(?P<path>/?.*?)(?P<file>[^/]+)\.(?P<ext>[^./]+)$'
+SHORTLINK_RE = r'^(?P<link>(?![a-zA-Z][a-zA-Z0-9+.-]*://)[^?#]*)(?P<anchor>#[^/]+)?$'
+IGNORE_DIRS = ['css', 'fonts', 'img', 'js', 'search', 'javascripts', 'assets/javascripts']
 
 
 class AwesomeAutolinksPluginConfig(BaseConfig):
     remove_re = config_options.Type(str, default=DEFAULT_REMOVE_RE)
-    warn_less = config_options.Type(bool, default=True)
+    warn_less = config_options.Type(bool, default=False)
     warn_on_no_use = config_options.Type(bool, default=True)
     ignore_dirs = config_options.ListOfItems(config_options.Type(str),
                                              default=IGNORE_DIRS)
@@ -48,20 +48,25 @@ class AwesomeAutolinksPlugin(BasePlugin[AwesomeAutolinksPluginConfig]):
         except re.error as e:
             log.error(f"Invalid regular expression '{self.config.remove_re}': {e.msg}")
 
-    def set_file_dest_uri(self, f: File, dest_uri: str, dest_dir: str, use_directory_urls: bool):
+    def set_file_dest_uri(self, f: File, dest_uri: str):
+        """ Replace the destination of the given MkDocs file object """
+
         f.dest_uri = dest_uri
-        f.url = f._get_url(use_directory_urls)
-        f.abs_dest_path = os.path.normpath(os.path.join(dest_dir, f.dest_uri))
+        # Delete cached properties that are based on dest_uri to force a recalculation
+        if 'abs_dest_path' in f.__dict__:
+            del f.__dict__['abs_dest_path']
+        if 'url' in f.__dict__:
+            del f.__dict__['url']
 
     def on_files(self, files: Files, config: MkDocsConfig, **kwargs) -> Optional[Files]:
         for f in files:
-            if f.src_uri.split('/')[0] in self.config.ignore_dirs:
+            if any(f.src_uri.startswith(dir) for dir in self.config.ignore_dirs):
                 continue
 
             # Remove the sorting components matching the ignore regex from the path
             if self.remove_re:
                 new_uri = self.delete_remove_re_from_uri(f.dest_uri)
-                self.set_file_dest_uri(f, new_uri, config.site_dir, config.use_directory_urls)
+                self.set_file_dest_uri(f, new_uri)
 
             # Populate the shortlinks dict with file objects
 
@@ -75,11 +80,14 @@ class AwesomeAutolinksPlugin(BasePlugin[AwesomeAutolinksPluginConfig]):
                 link_key_short = self.remove_re.sub('', link_key_short)
             self.shortlinks[link_key_short].append(f)
 
-            dir_name = fname_match.group('dir') if fname_match.group('dir') is not None else ""
+            path_name = fname_match.group('path') if fname_match.group('path') is not None else ""
+            path_segments = PurePath(path_name).parts
             if self.remove_re:
-                dir_name = self.remove_re.sub('', dir_name)
-            link_key_long = f"{dir_name}/{link_key_short}"
-            self.shortlinks[link_key_long].append(f)
+                path_segments = [self.remove_re.sub('', path_segment) for path_segment in path_segments]
+            for i in range(len(path_segments)):
+                segment_path = '/'.join(path_segments[i:])
+                link_key_long = f"{segment_path}/{link_key_short}"
+                self.shortlinks[link_key_long].append(f)
 
         if self.config.debug:
             for link_key, link_files in sorted(self.shortlinks.items()):
@@ -136,17 +144,20 @@ class AwesomeAutolinksPlugin(BasePlugin[AwesomeAutolinksPluginConfig]):
         return ''.join(segments)
 
     def replace_link(self, link: str, page_file: File) -> str:
-        if self.config.warn_on_no_use and link.startswith(('../', './')):
-            log.warning(f"Autolink functionality not used in link '{link}' on page '{page_file.src_uri}'")
-            return link
+        """ Replace the link with the corresponding shortlink if it exists """
 
         m = self.shortlink_re.search(link)
         if not m:
             return link
 
+        if not m.group('link'):
+            # Only anchor link
+            return link
+    
         new_link = self.get_link_from_shortlinks(m.group('link'), page_file)
         if not new_link:
-            log.warning(f"Unknown short link '{m.group('link')}' on page '{page_file.src_uri}'")
+            if self.config.warn_on_no_use:
+                log.warning(f"Awesome autolink functionality not used in link '{m.group('link')}' on page '{page_file.src_uri}'")
             return link
 
         if m.group('anchor'):
@@ -158,6 +169,11 @@ class AwesomeAutolinksPlugin(BasePlugin[AwesomeAutolinksPluginConfig]):
         return new_link
 
     def get_link_from_shortlinks(self, link: str, page_file: File) -> str:
+        """ 
+        Get the link from the shortlinks dict. 
+        If multiple links are available, try to find one in the same or a lower level directory of the page. 
+        """
+
         dst_files = self.shortlinks.get(link)
         if not dst_files:
             return None
@@ -165,6 +181,7 @@ class AwesomeAutolinksPlugin(BasePlugin[AwesomeAutolinksPluginConfig]):
         if len(dst_files) == 1:
             return utils.get_relative_url(dst_files[0].src_uri, page_file.src_uri)
 
+        # Multiple destinations available, see if we can find a single one at the same or a lower level directory of the page
         found_in_branch = 0
         new_link = None
         for dst_file in dst_files:
@@ -177,21 +194,27 @@ class AwesomeAutolinksPlugin(BasePlugin[AwesomeAutolinksPluginConfig]):
                 if found_in_branch == 1:
                     new_link = rel_link
 
-        if not self.config.warn_less:
+        if found_in_branch != 1:
+            # Either multiple links outside the directory branch of the page or multiple links inside the directory branch of the page or both
             log.warning(f"Multiple destinations available for link '{link}' on page '{page_file.src_uri}")
-        elif found_in_branch != 1:
-            log.warning(f"Multiple destinations available for link '{link}' on page '{page_file.src_uri}")
+        elif not self.config.warn_less:
+            # There is a single link in the same directory branch of the page but we are informing about it anyway
+            log.warning(f"Multiple destinations available for link '{link}' on page '{page_file.src_uri}` but found one in the same directory branch of the page")
 
         return new_link
 
     def delete_remove_re_from_uri(self, uri: str) -> str:
+        """ Remove all the sorting component matching the ignore regex from the path """
+
         components = []
 
-        for dir in uri.split('/'):
+        for dir in PurePath(uri).parts:
             components.append(self.remove_re.sub('', dir))
 
         return '/'.join(components)
 
     def log_debug(self, message: str):
+        """ Log a debug message if debug is enabled """
+
         if self.config.debug:
             log.info(f"DEBUG - {message}")
